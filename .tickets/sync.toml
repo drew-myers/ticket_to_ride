@@ -16,3 +16,13 @@ chore = "Chore"
 [labels]
 sync_tags = true  # Sync ticket tags as GitHub labels
 create_missing = true  # Create labels that don't exist
+
+[project]
+status_field = "Status"      # Project field for status
+iteration_field = "Iteration" # Project field for iteration
+iteration = "@current"        # Use current active iteration
+
+[project.status]
+open = "Todo"
+in_progress = "In Progress"
+closed = "Done"

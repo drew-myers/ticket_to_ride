@@ -13,6 +13,8 @@ pub struct Config {
     pub mapping: MappingConfig,
     #[serde(default)]
     pub labels: LabelsConfig,
+    #[serde(default)]
+    pub project: ProjectFieldsConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -69,6 +71,42 @@ fn default_type_field() -> String {
 
 fn default_true() -> bool {
     true
+}
+
+/// Configuration for syncing project fields (Status, Iteration)
+#[derive(Debug, Deserialize)]
+pub struct ProjectFieldsConfig {
+    /// Name of the Status field in the project (default: "Status")
+    #[serde(default = "default_status_field")]
+    pub status_field: String,
+    /// Name of the Iteration field in the project (default: "Iteration")
+    #[serde(default = "default_iteration_field")]
+    pub iteration_field: String,
+    /// Mapping from ticket status to project Status option
+    #[serde(default)]
+    pub status: HashMap<String, String>,
+    /// Iteration setting ("@current" for active iteration, or specific name)
+    #[serde(default)]
+    pub iteration: Option<String>,
+}
+
+impl Default for ProjectFieldsConfig {
+    fn default() -> Self {
+        Self {
+            status_field: default_status_field(),
+            iteration_field: default_iteration_field(),
+            status: HashMap::new(),
+            iteration: None,
+        }
+    }
+}
+
+fn default_status_field() -> String {
+    "Status".to_string()
+}
+
+fn default_iteration_field() -> String {
+    "Iteration".to_string()
 }
 
 impl GitHubConfig {
@@ -183,6 +221,11 @@ repo = "owner/repo"
         assert!(config.labels.sync_tags);
         assert!(config.labels.create_missing);
         assert_eq!(config.mapping.type_field, "Type");
+        // Project fields should have defaults
+        assert_eq!(config.project.status_field, "Status");
+        assert_eq!(config.project.iteration_field, "Iteration");
+        assert!(config.project.status.is_empty());
+        assert!(config.project.iteration.is_none());
     }
 
     #[test]
@@ -204,6 +247,16 @@ task = "Task"
 [labels]
 sync_tags = true
 create_missing = false
+
+[project]
+status_field = "Status"
+iteration_field = "Sprint"
+iteration = "@current"
+
+[project.status]
+open = "Todo"
+in_progress = "In Progress"
+closed = "Done"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.github.repo, "myorg/myrepo");
@@ -213,5 +266,18 @@ create_missing = false
         assert_eq!(config.mapping.type_map.get("bug"), Some(&"Bug".to_string()));
         assert!(config.labels.sync_tags);
         assert!(!config.labels.create_missing);
+        // Project fields
+        assert_eq!(config.project.status_field, "Status");
+        assert_eq!(config.project.iteration_field, "Sprint");
+        assert_eq!(config.project.iteration, Some("@current".to_string()));
+        assert_eq!(config.project.status.get("open"), Some(&"Todo".to_string()));
+        assert_eq!(
+            config.project.status.get("in_progress"),
+            Some(&"In Progress".to_string())
+        );
+        assert_eq!(
+            config.project.status.get("closed"),
+            Some(&"Done".to_string())
+        );
     }
 }

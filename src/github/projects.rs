@@ -4,6 +4,7 @@ use super::client::GitHubClient;
 use anyhow::Result;
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::HashMap;
 
 /// Information about a GitHub Project
 #[derive(Debug, Clone)]
@@ -17,6 +18,43 @@ pub struct ProjectInfo {
 #[derive(Debug, Clone)]
 pub struct ProjectItemInfo {
     pub item_id: String,
+}
+
+/// Information about a project field (Status or Iteration)
+#[derive(Debug, Clone)]
+pub struct ProjectFieldInfo {
+    pub id: String,
+    pub name: String,
+    pub field_type: ProjectFieldType,
+}
+
+/// Type of project field
+#[derive(Debug, Clone)]
+pub enum ProjectFieldType {
+    /// Single select field with options (e.g., Status)
+    SingleSelect { options: Vec<FieldOption> },
+    /// Iteration field with active and completed iterations
+    Iteration {
+        active: Vec<IterationOption>,
+        #[allow(dead_code)]
+        completed: Vec<IterationOption>,
+    },
+    /// Unknown/unsupported field type
+    Other,
+}
+
+/// Option for a single select field
+#[derive(Debug, Clone)]
+pub struct FieldOption {
+    pub id: String,
+    pub name: String,
+}
+
+/// Option for an iteration field
+#[derive(Debug, Clone)]
+pub struct IterationOption {
+    pub id: String,
+    pub title: String,
 }
 
 // Response types for GraphQL queries
@@ -91,6 +129,78 @@ struct AddProjectItemPayload {
 
 #[derive(Deserialize)]
 struct ProjectItemNode {
+    id: String,
+}
+
+// Response types for project field queries
+
+#[derive(Deserialize)]
+struct ProjectFieldsResponse {
+    node: Option<ProjectFieldsNode>,
+}
+
+#[derive(Deserialize)]
+struct ProjectFieldsNode {
+    fields: FieldConnection,
+}
+
+#[derive(Deserialize)]
+struct FieldConnection {
+    nodes: Vec<FieldNode>,
+}
+
+#[derive(Deserialize)]
+struct FieldNode {
+    id: String,
+    name: String,
+    #[serde(rename = "__typename")]
+    typename: String,
+    // For SingleSelectField
+    options: Option<Vec<SelectOptionNode>>,
+    // For IterationField
+    configuration: Option<IterationConfiguration>,
+}
+
+#[derive(Deserialize)]
+struct SelectOptionNode {
+    id: String,
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct IterationConfiguration {
+    iterations: Vec<IterationNode>,
+    #[serde(rename = "completedIterations")]
+    completed_iterations: Vec<IterationNode>,
+}
+
+#[derive(Deserialize)]
+struct IterationNode {
+    id: String,
+    title: String,
+}
+
+
+
+// Response types for field value updates
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct UpdateFieldValueResponse {
+    #[serde(rename = "updateProjectV2ItemFieldValue")]
+    update: Option<UpdateFieldValuePayload>,
+}
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct UpdateFieldValuePayload {
+    #[serde(rename = "projectV2Item")]
+    item: Option<UpdatedItemNode>,
+}
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct UpdatedItemNode {
     id: String,
 }
 
@@ -305,6 +415,410 @@ impl GitHubClient {
                     Err(e)
                 }
             }
+        }
+    }
+
+    /// Get project item IDs for issues that are already in a project
+    /// 
+    /// Returns a map of issue_node_id -> project_item_id for issues in the specified project.
+    /// Issues not in the project are omitted from the result.
+    pub async fn get_project_item_ids_batch(
+        &self,
+        project_id: &str,
+        issue_ids: &[String],
+    ) -> Result<HashMap<String, String>> {
+        if issue_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        // Build dynamic query with aliases
+        let queries: Vec<String> = issue_ids
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                format!(
+                    r#"issue_{i}: node(id: $id_{i}) {{
+                        ... on Issue {{
+                            projectItems(first: 10) {{
+                                nodes {{
+                                    id
+                                    project {{ id }}
+                                }}
+                            }}
+                        }}
+                    }}"#
+                )
+            })
+            .collect();
+
+        // Build variable definitions
+        let var_defs: Vec<String> = issue_ids
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("$id_{}: ID!", i))
+            .collect();
+
+        let query = format!(
+            "query({}) {{\n  {}\n}}",
+            var_defs.join(", "),
+            queries.join("\n  ")
+        );
+
+        // Build variables object
+        let mut variables = serde_json::Map::new();
+        for (i, issue_id) in issue_ids.iter().enumerate() {
+            variables.insert(format!("id_{}", i), json!(issue_id));
+        }
+
+        let response: serde_json::Value = self
+            .query(&query, Some(serde_json::Value::Object(variables)))
+            .await?;
+
+        // Parse results
+        let mut result = HashMap::new();
+        for (i, issue_id) in issue_ids.iter().enumerate() {
+            let key = format!("issue_{}", i);
+            if let Some(issue_data) = response.get(&key) {
+                if let Some(items) = issue_data
+                    .get("projectItems")
+                    .and_then(|pi| pi.get("nodes"))
+                    .and_then(|n| n.as_array())
+                {
+                    // Find the item for our target project
+                    for item in items {
+                        if let (Some(item_id), Some(proj_id)) = (
+                            item.get("id").and_then(|id| id.as_str()),
+                            item.get("project")
+                                .and_then(|p| p.get("id"))
+                                .and_then(|id| id.as_str()),
+                        ) {
+                            if proj_id == project_id {
+                                result.insert(issue_id.clone(), item_id.to_string());
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Get all fields for a project
+    pub async fn get_project_fields(&self, project_id: &str) -> Result<Vec<ProjectFieldInfo>> {
+        let query = r#"
+            query($projectId: ID!) {
+                node(id: $projectId) {
+                    ... on ProjectV2 {
+                        fields(first: 50) {
+                            nodes {
+                                ... on ProjectV2Field {
+                                    id
+                                    name
+                                    __typename
+                                }
+                                ... on ProjectV2SingleSelectField {
+                                    id
+                                    name
+                                    __typename
+                                    options {
+                                        id
+                                        name
+                                    }
+                                }
+                                ... on ProjectV2IterationField {
+                                    id
+                                    name
+                                    __typename
+                                    configuration {
+                                        iterations {
+                                            id
+                                            title
+                                        }
+                                        completedIterations {
+                                            id
+                                            title
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        "#;
+
+        let variables = json!({ "projectId": project_id });
+        let response: ProjectFieldsResponse = self.query(query, Some(variables)).await?;
+
+        let fields = response
+            .node
+            .map(|n| n.fields.nodes)
+            .unwrap_or_default();
+
+        Ok(fields
+            .into_iter()
+            .map(|f| {
+                let field_type = match f.typename.as_str() {
+                    "ProjectV2SingleSelectField" => {
+                        let options = f
+                            .options
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|o| FieldOption {
+                                id: o.id,
+                                name: o.name,
+                            })
+                            .collect();
+                        ProjectFieldType::SingleSelect { options }
+                    }
+                    "ProjectV2IterationField" => {
+                        let config = f.configuration.unwrap_or_else(|| IterationConfiguration {
+                            iterations: vec![],
+                            completed_iterations: vec![],
+                        });
+                        ProjectFieldType::Iteration {
+                            active: config
+                                .iterations
+                                .into_iter()
+                                .map(|i| IterationOption {
+                                    id: i.id,
+                                    title: i.title,
+                                })
+                                .collect(),
+                            completed: config
+                                .completed_iterations
+                                .into_iter()
+                                .map(|i| IterationOption {
+                                    id: i.id,
+                                    title: i.title,
+                                })
+                                .collect(),
+                        }
+                    }
+                    _ => ProjectFieldType::Other,
+                };
+
+                ProjectFieldInfo {
+                    id: f.id,
+                    name: f.name,
+                    field_type,
+                }
+            })
+            .collect())
+    }
+
+    /// Set a single-select field value on a project item
+    pub async fn set_project_item_single_select(
+        &self,
+        project_id: &str,
+        item_id: &str,
+        field_id: &str,
+        option_id: &str,
+    ) -> Result<()> {
+        let mutation = r#"
+            mutation($input: UpdateProjectV2ItemFieldValueInput!) {
+                updateProjectV2ItemFieldValue(input: $input) {
+                    projectV2Item {
+                        id
+                    }
+                }
+            }
+        "#;
+
+        let variables = json!({
+            "input": {
+                "projectId": project_id,
+                "itemId": item_id,
+                "fieldId": field_id,
+                "value": {
+                    "singleSelectOptionId": option_id
+                }
+            }
+        });
+
+        self.mutate::<UpdateFieldValueResponse>(mutation, Some(variables)).await?;
+        Ok(())
+    }
+
+    /// Set an iteration field value on a project item
+    pub async fn set_project_item_iteration(
+        &self,
+        project_id: &str,
+        item_id: &str,
+        field_id: &str,
+        iteration_id: &str,
+    ) -> Result<()> {
+        let mutation = r#"
+            mutation($input: UpdateProjectV2ItemFieldValueInput!) {
+                updateProjectV2ItemFieldValue(input: $input) {
+                    projectV2Item {
+                        id
+                    }
+                }
+            }
+        "#;
+
+        let variables = json!({
+            "input": {
+                "projectId": project_id,
+                "itemId": item_id,
+                "fieldId": field_id,
+                "value": {
+                    "iterationId": iteration_id
+                }
+            }
+        });
+
+        self.mutate::<UpdateFieldValueResponse>(mutation, Some(variables)).await?;
+        Ok(())
+    }
+
+    /// Batch set single-select field values on multiple project items
+    /// 
+    /// items: Vec of (item_id, option_id)
+    pub async fn set_project_items_single_select_batch(
+        &self,
+        project_id: &str,
+        field_id: &str,
+        items: &[(String, String)], // (item_id, option_id)
+    ) -> Result<Vec<Result<(), String>>> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Build dynamic mutation with aliases
+        let mutations: Vec<String> = items
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                format!(
+                    "update_{i}: updateProjectV2ItemFieldValue(input: $input_{i}) {{ projectV2Item {{ id }} }}"
+                )
+            })
+            .collect();
+
+        // Build variable definitions
+        let var_defs: Vec<String> = items
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("$input_{}: UpdateProjectV2ItemFieldValueInput!", i))
+            .collect();
+
+        let mutation = format!(
+            "mutation({}) {{\n  {}\n}}",
+            var_defs.join(", "),
+            mutations.join("\n  ")
+        );
+
+        // Build variables object
+        let mut variables = serde_json::Map::new();
+        for (i, (item_id, option_id)) in items.iter().enumerate() {
+            variables.insert(
+                format!("input_{}", i),
+                json!({
+                    "projectId": project_id,
+                    "itemId": item_id,
+                    "fieldId": field_id,
+                    "value": {
+                        "singleSelectOptionId": option_id
+                    }
+                }),
+            );
+        }
+
+        match self
+            .mutate::<serde_json::Value>(&mutation, Some(serde_json::Value::Object(variables)))
+            .await
+        {
+            Ok(response) => {
+                let mut results = Vec::with_capacity(items.len());
+                for i in 0..items.len() {
+                    let key = format!("update_{}", i);
+                    if response.get(&key).is_some() {
+                        results.push(Ok(()));
+                    } else {
+                        results.push(Err("Missing response for item".to_string()));
+                    }
+                }
+                Ok(results)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Batch set iteration field values on multiple project items
+    /// 
+    /// items: Vec of item_ids (all get same iteration)
+    pub async fn set_project_items_iteration_batch(
+        &self,
+        project_id: &str,
+        field_id: &str,
+        iteration_id: &str,
+        item_ids: &[String],
+    ) -> Result<Vec<Result<(), String>>> {
+        if item_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Build dynamic mutation with aliases
+        let mutations: Vec<String> = item_ids
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                format!(
+                    "update_{i}: updateProjectV2ItemFieldValue(input: $input_{i}) {{ projectV2Item {{ id }} }}"
+                )
+            })
+            .collect();
+
+        // Build variable definitions
+        let var_defs: Vec<String> = item_ids
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("$input_{}: UpdateProjectV2ItemFieldValueInput!", i))
+            .collect();
+
+        let mutation = format!(
+            "mutation({}) {{\n  {}\n}}",
+            var_defs.join(", "),
+            mutations.join("\n  ")
+        );
+
+        // Build variables object
+        let mut variables = serde_json::Map::new();
+        for (i, item_id) in item_ids.iter().enumerate() {
+            variables.insert(
+                format!("input_{}", i),
+                json!({
+                    "projectId": project_id,
+                    "itemId": item_id,
+                    "fieldId": field_id,
+                    "value": {
+                        "iterationId": iteration_id
+                    }
+                }),
+            );
+        }
+
+        match self
+            .mutate::<serde_json::Value>(&mutation, Some(serde_json::Value::Object(variables)))
+            .await
+        {
+            Ok(response) => {
+                let mut results = Vec::with_capacity(item_ids.len());
+                for i in 0..item_ids.len() {
+                    let key = format!("update_{}", i);
+                    if response.get(&key).is_some() {
+                        results.push(Ok(()));
+                    } else {
+                        results.push(Err("Missing response for item".to_string()));
+                    }
+                }
+                Ok(results)
+            }
+            Err(e) => Err(e),
         }
     }
 

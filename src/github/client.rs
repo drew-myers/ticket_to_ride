@@ -8,7 +8,9 @@ const GITHUB_GRAPHQL_URL: &str = "https://api.github.com/graphql";
 #[derive(Clone)]
 pub struct GitHubClient {
     client: reqwest::Client,
+    #[allow(dead_code)]
     token: String,
+    base_url: String,
 }
 
 #[derive(Serialize)]
@@ -52,6 +54,11 @@ impl std::fmt::Display for GraphQLError {
 impl GitHubClient {
     /// Create a new GitHub client with the given token
     pub fn new(token: String) -> Result<Self> {
+        Self::with_base_url(token, GITHUB_GRAPHQL_URL.to_string())
+    }
+
+    /// Create a new GitHub client with a custom base URL (for testing)
+    pub fn with_base_url(token: String, base_url: String) -> Result<Self> {
         let mut headers = HeaderMap::new();
         headers.insert(USER_AGENT, HeaderValue::from_static("ttr"));
         headers.insert(
@@ -65,7 +72,7 @@ impl GitHubClient {
             .build()
             .context("Failed to create HTTP client")?;
 
-        Ok(Self { client, token })
+        Ok(Self { client, token, base_url })
     }
 
     /// Execute a GraphQL query
@@ -78,7 +85,7 @@ impl GitHubClient {
 
         let response = self
             .client
-            .post(GITHUB_GRAPHQL_URL)
+            .post(&self.base_url)
             .json(&request)
             .send()
             .await

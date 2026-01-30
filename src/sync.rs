@@ -1,11 +1,33 @@
 use crate::config::Config;
 use crate::github::client::GitHubClient;
 use crate::github::issues::{ExistingIssue, IssueCreate, IssueUpdate};
-use crate::github::projects::ProjectInfo;
+use crate::github::projects::{ProjectFieldInfo, ProjectFieldType, ProjectInfo};
 use crate::github::subissues::SubIssueLink;
 use crate::ticket::Ticket;
 use anyhow::Result;
 use std::collections::HashMap;
+
+/// Cached project field information for setting Status/Iteration
+#[derive(Debug, Clone)]
+struct ProjectFieldsCache {
+    /// Status field ID and option ID mapping (ticket status -> option ID)
+    status: Option<StatusFieldCache>,
+    /// Iteration field ID and the iteration ID to use
+    iteration: Option<IterationFieldCache>,
+}
+
+#[derive(Debug, Clone)]
+struct StatusFieldCache {
+    field_id: String,
+    /// ticket status (lowercase) -> option ID
+    status_to_option: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+struct IterationFieldCache {
+    field_id: String,
+    iteration_id: String,
+}
 
 /// Result of syncing a single ticket
 #[derive(Debug, Clone)]
@@ -73,6 +95,7 @@ pub struct SyncEngine {
     ticket_to_issue: HashMap<String, u64>,      // ticket ID -> GitHub issue number
     issue_type_cache: HashMap<String, String>,  // issue type name (lowercase) -> ID
     project: Option<ProjectInfo>,               // Project to add issues to (if configured)
+    project_fields: Option<ProjectFieldsCache>, // Cached project field info for Status/Iteration
 }
 
 impl SyncEngine {
@@ -112,11 +135,15 @@ impl SyncEngine {
         }
 
         // Find project if configured
-        let project = if let Some(ref project_name) = config.github.project {
+        let (project, project_fields) = if let Some(ref project_name) = config.github.project {
             match client.find_project(&owner, &repo_name, project_name).await? {
                 Some(p) => {
                     println!("Using project: {} (#{})", p.title, p.number);
-                    Some(p)
+                    
+                    // Fetch and cache project fields if status/iteration mappings are configured
+                    let fields_cache = Self::setup_project_fields(&client, &p, &config).await?;
+                    
+                    (Some(p), fields_cache)
                 }
                 None => {
                     anyhow::bail!(
@@ -126,7 +153,7 @@ impl SyncEngine {
                 }
             }
         } else {
-            None
+            (None, None)
         };
 
         Ok(Self {
@@ -140,6 +167,7 @@ impl SyncEngine {
             ticket_to_issue: HashMap::new(), // Will be populated during sync
             issue_type_cache,
             project,
+            project_fields,
         })
     }
 
@@ -291,49 +319,255 @@ impl SyncEngine {
         // Phase 4: Link sub-issues (parent/child relationships)
         self.link_sub_issues(tickets, all_tickets, &results, &existing_issues).await;
 
-        // Phase 5: Add to project (if configured)
+        // Phase 5: Add to project and set fields for new issues
         self.add_to_project(&results, tickets).await;
+
+        // Phase 6: Sync project Status for all synced tickets
+        self.sync_project_status(tickets, &existing_issues).await;
 
         Ok(summary)
     }
 
-    /// Add newly created issues to the configured project
+    /// Add newly created issues to the configured project and set field values
     async fn add_to_project(&self, results: &[(usize, SyncResult)], tickets: &[Ticket]) {
         let project = match &self.project {
             Some(p) => p,
             None => return, // No project configured
         };
 
-        // Collect issue IDs for newly created issues
-        let mut issue_ids: Vec<(String, &str)> = Vec::new(); // (issue_id, ticket_id)
+        // Collect issue info for newly created issues
+        // (issue_id, ticket_id, ticket_status)
+        let mut issue_info: Vec<(String, &str, &str)> = Vec::new();
         for (idx, result) in results {
             if let SyncResult::Created { issue_id, .. } = result {
-                issue_ids.push((issue_id.clone(), &tickets[*idx].id));
+                let ticket = &tickets[*idx];
+                issue_info.push((issue_id.clone(), &ticket.id, &ticket.status));
             }
         }
 
-        if issue_ids.is_empty() {
+        if issue_info.is_empty() {
             return;
         }
 
         // Batch add to project
-        let ids: Vec<String> = issue_ids.iter().map(|(id, _)| id.clone()).collect();
-        match self.client.add_issues_to_project_batch(&project.id, &ids).await {
-            Ok(add_results) => {
-                println!();
-                for ((_, ticket_id), result) in issue_ids.iter().zip(add_results) {
-                    match result {
-                        Ok(_) => {
-                            println!("PROJECT {} → {} (added)", ticket_id, project.title);
+        let ids: Vec<String> = issue_info.iter().map(|(id, _, _)| id.clone()).collect();
+        let add_results = match self.client.add_issues_to_project_batch(&project.id, &ids).await {
+            Ok(results) => results,
+            Err(e) => {
+                eprintln!("\nWARN    Failed to add issues to project: {}", e);
+                return;
+            }
+        };
+
+        // Collect successfully added items with their item IDs
+        // (item_id, ticket_id, ticket_status)
+        let mut added_items: Vec<(String, &str, &str)> = Vec::new();
+        
+        println!();
+        for ((_, ticket_id, ticket_status), result) in issue_info.iter().zip(add_results) {
+            match result {
+                Ok(item_info) => {
+                    println!("PROJECT {} → {} (added)", ticket_id, project.title);
+                    if !item_info.item_id.is_empty() {
+                        added_items.push((item_info.item_id, ticket_id, ticket_status));
+                    }
+                }
+                Err(e) => {
+                    eprintln!("WARN    {} project add failed: {}", ticket_id, e);
+                }
+            }
+        }
+
+        // Set field values if we have items and field config
+        if !added_items.is_empty() {
+            if let Some(ref fields_cache) = self.project_fields {
+                self.set_project_field_values(&project.id, &added_items, fields_cache).await;
+            }
+        }
+    }
+
+    /// Set project field values (Status, Iteration) on newly added items
+    async fn set_project_field_values(
+        &self,
+        project_id: &str,
+        items: &[(String, &str, &str)], // (item_id, ticket_id, ticket_status)
+        fields_cache: &ProjectFieldsCache,
+    ) {
+        // Set Status field values
+        if let Some(ref status_cache) = fields_cache.status {
+            // Build (item_id, option_id) pairs for items with status mappings
+            let status_updates: Vec<(String, String)> = items
+                .iter()
+                .filter_map(|(item_id, _, ticket_status)| {
+                    status_cache
+                        .status_to_option
+                        .get(&ticket_status.to_lowercase())
+                        .map(|option_id| (item_id.clone(), option_id.clone()))
+                })
+                .collect();
+
+            if !status_updates.is_empty() {
+                match self
+                    .client
+                    .set_project_items_single_select_batch(
+                        project_id,
+                        &status_cache.field_id,
+                        &status_updates,
+                    )
+                    .await
+                {
+                    Ok(results) => {
+                        let success_count = results.iter().filter(|r| r.is_ok()).count();
+                        let fail_count = results.len() - success_count;
+                        if fail_count > 0 {
+                            eprintln!("WARN    {} status updates failed", fail_count);
                         }
-                        Err(e) => {
-                            eprintln!("WARN    {} project add failed: {}", ticket_id, e);
-                        }
+                    }
+                    Err(e) => {
+                        eprintln!("WARN    Failed to set project status: {}", e);
                     }
                 }
             }
+        }
+
+        // Set Iteration field values (all items get same iteration)
+        if let Some(ref iteration_cache) = fields_cache.iteration {
+            let item_ids: Vec<String> = items.iter().map(|(id, _, _)| id.clone()).collect();
+
+            match self
+                .client
+                .set_project_items_iteration_batch(
+                    project_id,
+                    &iteration_cache.field_id,
+                    &iteration_cache.iteration_id,
+                    &item_ids,
+                )
+                .await
+            {
+                Ok(results) => {
+                    let success_count = results.iter().filter(|r| r.is_ok()).count();
+                    let fail_count = results.len() - success_count;
+                    if fail_count > 0 {
+                        eprintln!("WARN    {} iteration updates failed", fail_count);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("WARN    Failed to set project iteration: {}", e);
+                }
+            }
+        }
+    }
+
+    /// Sync project Status field for all synced tickets
+    /// 
+    /// This updates the project Status for tickets that already exist in the project,
+    /// ensuring their project status matches the ticket status.
+    async fn sync_project_status(
+        &self,
+        tickets: &[Ticket],
+        existing_issues: &HashMap<u64, ExistingIssue>,
+    ) {
+        // Skip if no project or no status field configured
+        let project = match &self.project {
+            Some(p) => p,
+            None => return,
+        };
+
+        let fields_cache = match &self.project_fields {
+            Some(f) => f,
+            None => return,
+        };
+
+        let status_cache = match &fields_cache.status {
+            Some(s) => s,
+            None => return,
+        };
+
+        // Collect synced tickets with status mappings
+        // (issue_node_id, ticket_id, option_id)
+        let mut tickets_to_sync: Vec<(String, &str, String)> = Vec::new();
+
+        for ticket in tickets {
+            // Skip unsynced tickets (handled by add_to_project)
+            let issue_number = match ticket.github_issue_number() {
+                Some(n) => n,
+                None => continue,
+            };
+
+            // Get issue node ID from existing_issues
+            let issue_node_id = match existing_issues.get(&issue_number) {
+                Some(issue) => &issue.id,
+                None => continue,
+            };
+
+            // Check if we have a status mapping for this ticket
+            if let Some(option_id) = status_cache
+                .status_to_option
+                .get(&ticket.status.to_lowercase())
+            {
+                tickets_to_sync.push((issue_node_id.clone(), &ticket.id, option_id.clone()));
+            }
+        }
+
+        if tickets_to_sync.is_empty() {
+            return;
+        }
+
+        // Get issue IDs that need status updates
+        let issue_ids: Vec<String> = tickets_to_sync
+            .iter()
+            .map(|(id, _, _)| id.clone())
+            .collect();
+
+        // Fetch project item IDs for these issues
+        let item_ids = match self
+            .client
+            .get_project_item_ids_batch(&project.id, &issue_ids)
+            .await
+        {
+            Ok(ids) => ids,
             Err(e) => {
-                eprintln!("\nWARN    Failed to add issues to project: {}", e);
+                eprintln!("WARN    Failed to fetch project item IDs: {}", e);
+                return;
+            }
+        };
+
+        // Build (item_id, option_id) pairs for items we found
+        let status_updates: Vec<(String, String)> = tickets_to_sync
+            .iter()
+            .filter_map(|(issue_id, _, option_id)| {
+                item_ids
+                    .get(issue_id)
+                    .map(|item_id| (item_id.clone(), option_id.clone()))
+            })
+            .collect();
+
+        if status_updates.is_empty() {
+            return; // No items in project to update
+        }
+
+        // Batch update status
+        match self
+            .client
+            .set_project_items_single_select_batch(
+                &project.id,
+                &status_cache.field_id,
+                &status_updates,
+            )
+            .await
+        {
+            Ok(results) => {
+                let success_count = results.iter().filter(|r| r.is_ok()).count();
+                if success_count > 0 {
+                    println!("STATUS  {} project item(s) synced", success_count);
+                }
+                let fail_count = results.len() - success_count;
+                if fail_count > 0 {
+                    eprintln!("WARN    {} project status updates failed", fail_count);
+                }
+            }
+            Err(e) => {
+                eprintln!("WARN    Failed to update project status: {}", e);
             }
         }
     }
@@ -649,6 +883,175 @@ impl SyncEngine {
                 eprintln!("\nWARN    sub-issue batch link failed: {}", e);
             }
         }
+    }
+
+    /// Setup project fields cache by fetching and validating field mappings
+    async fn setup_project_fields(
+        client: &GitHubClient,
+        project: &ProjectInfo,
+        config: &Config,
+    ) -> Result<Option<ProjectFieldsCache>> {
+        // Skip if no status mappings and no iteration configured
+        if config.project.status.is_empty() && config.project.iteration.is_none() {
+            return Ok(None);
+        }
+
+        // Fetch project fields
+        let fields = client.get_project_fields(&project.id).await?;
+
+        // Setup status field cache
+        let status_cache = if !config.project.status.is_empty() {
+            Self::setup_status_field(&fields, config)?
+        } else {
+            None
+        };
+
+        // Setup iteration field cache
+        let iteration_cache = if config.project.iteration.is_some() {
+            Self::setup_iteration_field(&fields, config)?
+        } else {
+            None
+        };
+
+        if status_cache.is_some() || iteration_cache.is_some() {
+            Ok(Some(ProjectFieldsCache {
+                status: status_cache,
+                iteration: iteration_cache,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Setup status field cache, validating options exist
+    fn setup_status_field(
+        fields: &[ProjectFieldInfo],
+        config: &Config,
+    ) -> Result<Option<StatusFieldCache>> {
+        // Find the status field by name (case-insensitive)
+        let status_field_name = config.project.status_field.to_lowercase();
+        let status_field = fields.iter().find(|f| f.name.to_lowercase() == status_field_name);
+
+        let field = match status_field {
+            Some(f) => f,
+            None => {
+                eprintln!(
+                    "WARN    Project field '{}' not found, skipping status sync",
+                    config.project.status_field
+                );
+                return Ok(None);
+            }
+        };
+
+        // Get options from field
+        let options = match &field.field_type {
+            ProjectFieldType::SingleSelect { options } => options,
+            _ => {
+                eprintln!(
+                    "WARN    Project field '{}' is not a single-select field, skipping status sync",
+                    config.project.status_field
+                );
+                return Ok(None);
+            }
+        };
+
+        // Build status -> option ID mapping, validating each
+        let mut status_to_option = HashMap::new();
+        for (ticket_status, project_option_name) in &config.project.status {
+            let option_name_lower = project_option_name.to_lowercase();
+            let option = options.iter().find(|o| o.name.to_lowercase() == option_name_lower);
+
+            match option {
+                Some(o) => {
+                    status_to_option.insert(ticket_status.to_lowercase(), o.id.clone());
+                }
+                None => {
+                    let available: Vec<&str> = options.iter().map(|o| o.name.as_str()).collect();
+                    anyhow::bail!(
+                        "Project status option '{}' (for ticket status '{}') not found.\nAvailable options: {:?}",
+                        project_option_name,
+                        ticket_status,
+                        available
+                    );
+                }
+            }
+        }
+
+        Ok(Some(StatusFieldCache {
+            field_id: field.id.clone(),
+            status_to_option,
+        }))
+    }
+
+    /// Setup iteration field cache, finding current iteration if @current
+    fn setup_iteration_field(
+        fields: &[ProjectFieldInfo],
+        config: &Config,
+    ) -> Result<Option<IterationFieldCache>> {
+        let iteration_setting = match &config.project.iteration {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        // Find the iteration field by name (case-insensitive)
+        let iteration_field_name = config.project.iteration_field.to_lowercase();
+        let iteration_field = fields.iter().find(|f| f.name.to_lowercase() == iteration_field_name);
+
+        let field = match iteration_field {
+            Some(f) => f,
+            None => {
+                eprintln!(
+                    "WARN    Project field '{}' not found, skipping iteration sync",
+                    config.project.iteration_field
+                );
+                return Ok(None);
+            }
+        };
+
+        // Get iterations from field
+        let (active, _completed) = match &field.field_type {
+            ProjectFieldType::Iteration { active, completed } => (active, completed),
+            _ => {
+                eprintln!(
+                    "WARN    Project field '{}' is not an iteration field, skipping iteration sync",
+                    config.project.iteration_field
+                );
+                return Ok(None);
+            }
+        };
+
+        // Resolve iteration ID
+        let iteration_id = if iteration_setting == "@current" {
+            // Use first active iteration
+            match active.first() {
+                Some(iter) => iter.id.clone(),
+                None => {
+                    eprintln!("WARN    No active iteration found, skipping iteration sync");
+                    return Ok(None);
+                }
+            }
+        } else {
+            // Find iteration by name
+            let iter_name_lower = iteration_setting.to_lowercase();
+            let iter = active.iter().find(|i| i.title.to_lowercase() == iter_name_lower);
+
+            match iter {
+                Some(i) => i.id.clone(),
+                None => {
+                    let available: Vec<&str> = active.iter().map(|i| i.title.as_str()).collect();
+                    anyhow::bail!(
+                        "Iteration '{}' not found.\nAvailable active iterations: {:?}",
+                        iteration_setting,
+                        available
+                    );
+                }
+            }
+        };
+
+        Ok(Some(IterationFieldCache {
+            field_id: field.id.clone(),
+            iteration_id,
+        }))
     }
 }
 
