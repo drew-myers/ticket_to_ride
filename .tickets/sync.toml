@@ -1,10 +1,10 @@
 [github]
 repo = "drew-myers/ticket_to_ride"
-# project = "Project Name"
+# project = "Project Name"  # Optional: GitHub Project to add issues to
 assignee = "drew-myers"
 
 [mapping]
-type_field = "Type"
+type_field = "Type"  # Project field name for ticket type
 
 [mapping.type]
 bug = "Bug"
@@ -14,5 +14,5 @@ epic = "Epic"
 chore = "Chore"
 
 [labels]
-sync_tags = true
-create_missing = true
+sync_tags = true  # Sync ticket tags as GitHub labels
+create_missing = true  # Create labels that don't exist

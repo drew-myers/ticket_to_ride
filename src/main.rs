@@ -24,7 +24,20 @@ enum Commands {
         quick: bool,
     },
     /// Create .tickets/sync.toml configuration
-    Init,
+    Init {
+        /// GitHub repository (owner/repo)
+        #[arg(short, long)]
+        repo: Option<String>,
+        /// GitHub Project name
+        #[arg(short, long)]
+        project: Option<String>,
+        /// Default assignee username
+        #[arg(short, long)]
+        assignee: Option<String>,
+        /// Overwrite existing config
+        #[arg(short, long)]
+        force: bool,
+    },
 }
 
 #[tokio::main]
@@ -34,7 +47,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Push { ids } => cmd_push(ids).await,
         Commands::Status { quick } => cmd_status(quick).await,
-        Commands::Init => cmd_init(),
+        Commands::Init { repo, project, assignee, force } => cmd_init(repo, project, assignee, force),
     }
 }
 
@@ -86,6 +99,44 @@ async fn cmd_push(ids: Vec<String>) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Try to detect GitHub repo from git remote origin
+fn detect_github_repo() -> Option<String> {
+    use std::process::Command;
+
+    let output = Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let url = String::from_utf8(output.stdout).ok()?;
+    let url = url.trim();
+
+    // Parse various GitHub URL formats:
+    // git@github.com:owner/repo.git
+    // https://github.com/owner/repo.git
+    // https://github.com/owner/repo
+
+    if url.contains("github.com") {
+        // SSH format: git@github.com:owner/repo.git
+        if let Some(rest) = url.strip_prefix("git@github.com:") {
+            let repo = rest.trim_end_matches(".git");
+            return Some(repo.to_string());
+        }
+
+        // HTTPS format: https://github.com/owner/repo.git
+        if let Some(rest) = url.strip_prefix("https://github.com/") {
+            let repo = rest.trim_end_matches(".git");
+            return Some(repo.to_string());
+        }
+    }
+
+    None
 }
 
 async fn cmd_status(quick: bool) -> Result<()> {
@@ -252,16 +303,22 @@ async fn cmd_status(quick: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_init() -> Result<()> {
+fn cmd_init(
+    repo: Option<String>,
+    project: Option<String>,
+    assignee: Option<String>,
+    force: bool,
+) -> Result<()> {
     use std::fs;
+    use std::io::{self, BufRead, Write};
     use std::path::Path;
 
     let tickets_dir = Path::new(".tickets");
     let config_path = tickets_dir.join("sync.toml");
 
-    if config_path.exists() {
+    if config_path.exists() && !force {
         anyhow::bail!(
-            "Configuration already exists: {}\nUse --force to overwrite (not implemented yet)",
+            "Configuration already exists: {}\nUse --force to overwrite.",
             config_path.display()
         );
     }
@@ -272,11 +329,80 @@ fn cmd_init() -> Result<()> {
         println!("Created {}/", tickets_dir.display());
     }
 
-    let default_config = r#"[github]
-repo = "owner/repo"  # Required: your GitHub repository
-# project = "Project Name"  # Optional: GitHub Project to add issues to
-# assignee = "username"  # Optional: assign all issues to this user
+    // Determine repo - from flag, git remote, or prompt
+    let repo = if let Some(r) = repo {
+        r
+    } else if let Some(r) = detect_github_repo() {
+        println!("Detected repository: {}", r);
+        r
+    } else {
+        // Interactive prompt
+        print!("GitHub repository (owner/repo): ");
+        io::stdout().flush()?;
+        let mut input = String::new();
+        io::stdin().lock().read_line(&mut input)?;
+        let input = input.trim();
+        if input.is_empty() {
+            anyhow::bail!("Repository is required");
+        }
+        input.to_string()
+    };
 
+    // Validate repo format
+    if !repo.contains('/') || repo.split('/').count() != 2 {
+        anyhow::bail!("Invalid repository format. Expected 'owner/repo'");
+    }
+
+    // Determine project - from flag or prompt
+    let project = if let Some(p) = project {
+        Some(p)
+    } else if atty::is(atty::Stream::Stdin) {
+        print!("GitHub Project name (optional, press Enter to skip): ");
+        io::stdout().flush()?;
+        let mut input = String::new();
+        io::stdin().lock().read_line(&mut input)?;
+        let input = input.trim();
+        if input.is_empty() { None } else { Some(input.to_string()) }
+    } else {
+        None
+    };
+
+    // Determine assignee - from flag or prompt
+    let assignee = if let Some(a) = assignee {
+        Some(a)
+    } else if atty::is(atty::Stream::Stdin) {
+        print!("Default assignee (optional, press Enter to skip): ");
+        io::stdout().flush()?;
+        let mut input = String::new();
+        io::stdin().lock().read_line(&mut input)?;
+        let input = input.trim();
+        if input.is_empty() { None } else { Some(input.to_string()) }
+    } else {
+        None
+    };
+
+    // Build config
+    let mut config = format!(
+        r#"[github]
+repo = "{}"
+"#,
+        repo
+    );
+
+    if let Some(p) = &project {
+        config.push_str(&format!("project = \"{}\"\n", p));
+    } else {
+        config.push_str("# project = \"Project Name\"  # Optional: GitHub Project to add issues to\n");
+    }
+
+    if let Some(a) = &assignee {
+        config.push_str(&format!("assignee = \"{}\"\n", a));
+    } else {
+        config.push_str("# assignee = \"username\"  # Optional: assign all issues to this user\n");
+    }
+
+    config.push_str(
+        r#"
 [mapping]
 type_field = "Type"  # Project field name for ticket type
 
@@ -290,14 +416,20 @@ chore = "Chore"
 [labels]
 sync_tags = true  # Sync ticket tags as GitHub labels
 create_missing = true  # Create labels that don't exist
-"#;
+"#,
+    );
 
-    fs::write(&config_path, default_config)?;
+    fs::write(&config_path, config)?;
+    println!();
     println!("Created {}", config_path.display());
     println!();
     println!("Next steps:");
-    println!("  1. Edit {} and set your repository", config_path.display());
-    println!("  2. Run 'ttr push' to sync tickets");
+    if project.is_none() || assignee.is_none() {
+        println!("  1. Edit {} to customize settings", config_path.display());
+        println!("  2. Run 'ttr push' to sync tickets");
+    } else {
+        println!("  1. Run 'ttr push' to sync tickets");
+    }
 
     Ok(())
 }
