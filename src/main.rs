@@ -61,31 +61,35 @@ async fn cmd_push(ids: Vec<String>) -> Result<()> {
     // Create GitHub client
     let client = GitHubClient::new(token)?;
 
-    // Load tickets
-    let mut tickets = Ticket::load_all(&tickets_dir)?;
+    // Load ALL tickets (needed for dependency lookup)
+    let all_tickets = Ticket::load_all(&tickets_dir)?;
 
-    if tickets.is_empty() {
+    if all_tickets.is_empty() {
         println!("No tickets found in {}", tickets_dir.display());
         return Ok(());
     }
 
-    // Filter to specific IDs if provided
-    if !ids.is_empty() {
-        tickets.retain(|t| {
-            ids.iter().any(|id| t.id == *id || t.id.contains(id))
-        });
+    // Filter to specific IDs if provided, but keep all_tickets for lookup
+    let mut tickets: Vec<Ticket> = if ids.is_empty() {
+        all_tickets.clone()
+    } else {
+        all_tickets
+            .iter()
+            .filter(|t| ids.iter().any(|id| t.id == *id || t.id.contains(id)))
+            .cloned()
+            .collect()
+    };
 
-        if tickets.is_empty() {
-            println!("No tickets matched the provided IDs: {:?}", ids);
-            return Ok(());
-        }
+    if tickets.is_empty() {
+        println!("No tickets matched the provided IDs: {:?}", ids);
+        return Ok(());
     }
 
     println!("Syncing {} ticket(s) to {}...\n", tickets.len(), config.github.repo);
 
-    // Create sync engine and run
+    // Create sync engine and run (pass all_tickets for dependency lookup)
     let mut engine = SyncEngine::new(client, config).await?;
-    let summary = engine.sync(&mut tickets).await?;
+    let summary = engine.sync(&mut tickets, &all_tickets).await?;
 
     // Print summary
     println!();

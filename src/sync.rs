@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::github::client::GitHubClient;
 use crate::github::issues::{ExistingIssue, IssueCreate, IssueUpdate};
+use crate::github::subissues::SubIssueLink;
 use crate::ticket::Ticket;
 use anyhow::Result;
 use std::collections::HashMap;
@@ -8,7 +9,7 @@ use std::collections::HashMap;
 /// Result of syncing a single ticket
 #[derive(Debug, Clone)]
 pub enum SyncResult {
-    Created { issue_number: u64, url: String },
+    Created { issue_id: String, issue_number: u64, url: String },
     Updated { issue_number: u64 },
     Skipped { reason: String },
     Failed { error: String },
@@ -65,7 +66,8 @@ pub struct SyncEngine {
     owner: String,
     repo_name: String,
     assignee_id: Option<String>,
-    label_cache: HashMap<String, String>, // label name -> label ID
+    label_cache: HashMap<String, String>,  // label name -> label ID
+    ticket_to_issue: HashMap<String, u64>, // ticket ID -> GitHub issue number
 }
 
 impl SyncEngine {
@@ -100,19 +102,42 @@ impl SyncEngine {
             repo_name,
             assignee_id,
             label_cache,
+            ticket_to_issue: HashMap::new(), // Will be populated during sync
         })
     }
 
     /// Sync a list of tickets
-    pub async fn sync(&mut self, tickets: &mut [Ticket]) -> Result<SyncSummary> {
+    /// 
+    /// `tickets` are the tickets to sync, `all_tickets` is used to build the
+    /// dependency lookup (for rendering "Depends on" references).
+    pub async fn sync(&mut self, tickets: &mut [Ticket], all_tickets: &[Ticket]) -> Result<SyncSummary> {
         let mut summary = SyncSummary::default();
         let mut results: Vec<(usize, SyncResult)> = Vec::new();
 
+        // Build ticket ID → issue number lookup for dependency resolution
+        // Use all_tickets so deps resolve even when pushing a subset
+        self.ticket_to_issue = all_tickets
+            .iter()
+            .filter_map(|t| t.github_issue_number().map(|n| (t.id.clone(), n)))
+            .collect();
+
         // Batch fetch all existing issues upfront
-        let issue_numbers: Vec<u64> = tickets
+        // Include both tickets being synced AND their parents (for sub-issue linking)
+        let mut issue_numbers: Vec<u64> = tickets
             .iter()
             .filter_map(|t| t.github_issue_number())
             .collect();
+
+        // Also fetch parent issues (need their node IDs for sub-issue linking)
+        for ticket in tickets.iter() {
+            if let Some(ref parent_id) = ticket.parent {
+                if let Some(parent_num) = self.ticket_to_issue.get(parent_id) {
+                    if !issue_numbers.contains(parent_num) {
+                        issue_numbers.push(*parent_num);
+                    }
+                }
+            }
+        }
 
         let existing_issues = if !issue_numbers.is_empty() {
             self.client
@@ -194,10 +219,10 @@ impl SyncEngine {
         // Sort by original index and print results
         results.sort_by_key(|(idx, _)| *idx);
 
-        for (idx, result) in results {
-            let ticket = &tickets[idx];
-            match &result {
-                SyncResult::Created { issue_number, url } => {
+        for (idx, result) in &results {
+            let ticket = &tickets[*idx];
+            match result {
+                SyncResult::Created { issue_number, url, .. } => {
                     println!(
                         "CREATE  {} → #{}  {}",
                         ticket.id, issue_number, ticket.title
@@ -222,6 +247,9 @@ impl SyncEngine {
                 }
             }
         }
+
+        // Phase 4: Link sub-issues (parent/child relationships)
+        self.link_sub_issues(tickets, all_tickets, &results, &existing_issues).await;
 
         Ok(summary)
     }
@@ -380,6 +408,7 @@ impl SyncEngine {
                     .into_iter()
                     .map(|result| match result {
                         Ok(info) => SyncResult::Created {
+                            issue_id: info.id,
                             issue_number: info.number,
                             url: info.url,
                         },
@@ -431,19 +460,147 @@ impl SyncEngine {
         label_ids
     }
 
-    /// Format the issue body with marker and content
+    /// Format the issue body with marker, content, and dependencies
     fn format_issue_body(&self, ticket: &Ticket) -> String {
-        format_issue_body(&ticket.id, &ticket.body)
+        format_issue_body_with_deps(&ticket.id, &ticket.body, &ticket.deps, &self.ticket_to_issue)
+    }
+
+    /// Link sub-issues based on ticket parent relationships
+    /// 
+    /// This runs after all creates/updates, using a two-pass approach:
+    /// 1. Build a map of ticket_id → issue_node_id from existing issues and newly created ones
+    /// 2. For each ticket with a parent, link child to parent as a sub-issue
+    async fn link_sub_issues(
+        &self,
+        tickets: &[Ticket],
+        all_tickets: &[Ticket],
+        results: &[(usize, SyncResult)],
+        existing_issues: &HashMap<u64, ExistingIssue>,
+    ) {
+        // Build ticket_id → issue_node_id map
+        let mut ticket_to_node_id: HashMap<String, String> = HashMap::new();
+
+        // Add from existing issues (looked up at start of sync)
+        for ticket in all_tickets {
+            if let Some(issue_num) = ticket.github_issue_number() {
+                if let Some(existing) = existing_issues.get(&issue_num) {
+                    ticket_to_node_id.insert(ticket.id.clone(), existing.id.clone());
+                }
+            }
+        }
+
+        // Add from newly created issues in this sync
+        for (idx, result) in results {
+            if let SyncResult::Created { issue_id, .. } = result {
+                let ticket = &tickets[*idx];
+                ticket_to_node_id.insert(ticket.id.clone(), issue_id.clone());
+            }
+        }
+
+        // Collect sub-issue links to create
+        let mut links: Vec<(String, SubIssueLink)> = Vec::new(); // (child_ticket_id, link)
+
+        for ticket in tickets {
+            if let Some(ref parent_id) = ticket.parent {
+                // Look up both parent and child node IDs
+                let parent_node_id = ticket_to_node_id.get(parent_id);
+                let child_node_id = ticket_to_node_id.get(&ticket.id);
+
+                match (parent_node_id, child_node_id) {
+                    (Some(parent_id), Some(child_id)) => {
+                        links.push((
+                            ticket.id.clone(),
+                            SubIssueLink {
+                                parent_issue_id: parent_id.clone(),
+                                child_issue_id: child_id.clone(),
+                            },
+                        ));
+                    }
+                    (None, _) => {
+                        // Parent not synced - skip silently, it will link on next push
+                    }
+                    (_, None) => {
+                        // Child not synced - shouldn't happen since we just synced it
+                    }
+                }
+            }
+        }
+
+        if links.is_empty() {
+            return;
+        }
+
+        // Batch link sub-issues (single GraphQL mutation)
+        let sub_issue_links: Vec<SubIssueLink> = links.iter().map(|(_, link)| link.clone()).collect();
+        
+        match self.client.add_sub_issues_batch(&sub_issue_links).await {
+            Ok(results) => {
+                println!();
+                for ((child_id, link), result) in links.iter().zip(results) {
+                    // Find parent ticket ID for display
+                    let parent_ticket_id = all_tickets
+                        .iter()
+                        .find(|t| ticket_to_node_id.get(&t.id) == Some(&link.parent_issue_id))
+                        .map(|t| t.id.as_str())
+                        .unwrap_or("?");
+
+                    match result {
+                        Ok(()) => {
+                            println!("LINK    {} → {} (sub-issue)", child_id, parent_ticket_id);
+                        }
+                        Err(e) => {
+                            eprintln!("WARN    {} sub-issue link failed: {}", child_id, e);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("\nWARN    sub-issue batch link failed: {}", e);
+            }
+        }
     }
 }
 
 /// Format the issue body with marker and content (public for testing)
 pub fn format_issue_body(ticket_id: &str, ticket_body: &str) -> String {
+    format_issue_body_with_deps(ticket_id, ticket_body, &[], &HashMap::new())
+}
+
+/// Format the issue body with marker, content, and dependency references
+pub fn format_issue_body_with_deps(
+    ticket_id: &str,
+    ticket_body: &str,
+    deps: &[String],
+    ticket_to_issue: &HashMap<String, u64>,
+) -> String {
     let mut body = format!("<!-- ticket:{} -->\n\n", ticket_id);
     body.push_str(ticket_body);
+
+    // Add dependencies section if there are any
+    if !deps.is_empty() {
+        body.push_str("\n\n---\n");
+        body.push_str(&format_dependencies_section(deps, ticket_to_issue));
+    }
+
     body.push_str("\n\n---\n");
     body.push_str(&format!("<sub>Synced from ticket `{}`</sub>", ticket_id));
     body
+}
+
+/// Format the dependencies section for the issue body
+fn format_dependencies_section(deps: &[String], ticket_to_issue: &HashMap<String, u64>) -> String {
+    let refs: Vec<String> = deps
+        .iter()
+        .map(|dep_id| {
+            if let Some(issue_num) = ticket_to_issue.get(dep_id) {
+                format!("#{}", issue_num)
+            } else {
+                format!("`{}` (not synced)", dep_id)
+            }
+        })
+        .collect();
+
+    format!("**Depends on:** {}", refs.join(", "))
 }
 
 /// Extract ticket ID from issue body marker
@@ -495,5 +652,63 @@ mod tests {
         let body = format_issue_body(original_id, "Content here");
         let extracted = extract_ticket_marker(&body);
         assert_eq!(extracted, Some(original_id));
+    }
+
+    #[test]
+    fn test_format_issue_body_with_deps_all_synced() {
+        let mut lookup = HashMap::new();
+        lookup.insert("ttr-0002".to_string(), 45);
+        lookup.insert("ttr-0003".to_string(), 67);
+
+        let deps = vec!["ttr-0002".to_string(), "ttr-0003".to_string()];
+        let body = format_issue_body_with_deps("ttr-0001", "Description", &deps, &lookup);
+
+        assert!(body.contains("**Depends on:** #45, #67"));
+        assert!(body.contains("<sub>Synced from ticket `ttr-0001`</sub>"));
+    }
+
+    #[test]
+    fn test_format_issue_body_with_deps_none_synced() {
+        let lookup = HashMap::new();
+        let deps = vec!["ttr-0002".to_string(), "ttr-0003".to_string()];
+        let body = format_issue_body_with_deps("ttr-0001", "Description", &deps, &lookup);
+
+        assert!(body.contains("**Depends on:** `ttr-0002` (not synced), `ttr-0003` (not synced)"));
+    }
+
+    #[test]
+    fn test_format_issue_body_with_deps_mixed() {
+        let mut lookup = HashMap::new();
+        lookup.insert("ttr-0002".to_string(), 45);
+        // ttr-0003 not in lookup (not synced)
+
+        let deps = vec!["ttr-0002".to_string(), "ttr-0003".to_string()];
+        let body = format_issue_body_with_deps("ttr-0001", "Description", &deps, &lookup);
+
+        assert!(body.contains("**Depends on:** #45, `ttr-0003` (not synced)"));
+    }
+
+    #[test]
+    fn test_format_issue_body_with_no_deps() {
+        let lookup = HashMap::new();
+        let deps: Vec<String> = vec![];
+        let body = format_issue_body_with_deps("ttr-0001", "Description", &deps, &lookup);
+
+        // Should not contain "Depends on" section
+        assert!(!body.contains("Depends on"));
+        // But still has the footer
+        assert!(body.contains("<sub>Synced from ticket `ttr-0001`</sub>"));
+    }
+
+    #[test]
+    fn test_format_dependencies_section() {
+        let mut lookup = HashMap::new();
+        lookup.insert("dep-1".to_string(), 10);
+        lookup.insert("dep-2".to_string(), 20);
+
+        let deps = vec!["dep-1".to_string(), "dep-2".to_string(), "dep-3".to_string()];
+        let section = format_dependencies_section(&deps, &lookup);
+
+        assert_eq!(section, "**Depends on:** #10, #20, `dep-3` (not synced)");
     }
 }
