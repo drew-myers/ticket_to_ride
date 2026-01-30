@@ -1,6 +1,6 @@
 [github]
 repo = "drew-myers/ticket_to_ride"
-# project = "Project Name"  # Optional: GitHub Project to add issues to
+project = "ttr Roadmap"  # GitHub Project to add issues to
 assignee = "drew-myers"
 
 [mapping]

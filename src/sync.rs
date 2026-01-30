@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::github::client::GitHubClient;
 use crate::github::issues::{ExistingIssue, IssueCreate, IssueUpdate};
+use crate::github::projects::ProjectInfo;
 use crate::github::subissues::SubIssueLink;
 use crate::ticket::Ticket;
 use anyhow::Result;
@@ -71,6 +72,7 @@ pub struct SyncEngine {
     label_cache: HashMap<String, String>,       // label name -> label ID
     ticket_to_issue: HashMap<String, u64>,      // ticket ID -> GitHub issue number
     issue_type_cache: HashMap<String, String>,  // issue type name (lowercase) -> ID
+    project: Option<ProjectInfo>,               // Project to add issues to (if configured)
 }
 
 impl SyncEngine {
@@ -109,6 +111,24 @@ impl SyncEngine {
             anyhow::bail!("{}", e);
         }
 
+        // Find project if configured
+        let project = if let Some(ref project_name) = config.github.project {
+            match client.find_project(&owner, &repo_name, project_name).await? {
+                Some(p) => {
+                    println!("Using project: {} (#{})", p.title, p.number);
+                    Some(p)
+                }
+                None => {
+                    anyhow::bail!(
+                        "Project '{}' not found. Check the project name or number in sync.toml.",
+                        project_name
+                    );
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             client,
             config,
@@ -119,6 +139,7 @@ impl SyncEngine {
             label_cache,
             ticket_to_issue: HashMap::new(), // Will be populated during sync
             issue_type_cache,
+            project,
         })
     }
 
@@ -270,7 +291,51 @@ impl SyncEngine {
         // Phase 4: Link sub-issues (parent/child relationships)
         self.link_sub_issues(tickets, all_tickets, &results, &existing_issues).await;
 
+        // Phase 5: Add to project (if configured)
+        self.add_to_project(&results, tickets).await;
+
         Ok(summary)
+    }
+
+    /// Add newly created issues to the configured project
+    async fn add_to_project(&self, results: &[(usize, SyncResult)], tickets: &[Ticket]) {
+        let project = match &self.project {
+            Some(p) => p,
+            None => return, // No project configured
+        };
+
+        // Collect issue IDs for newly created issues
+        let mut issue_ids: Vec<(String, &str)> = Vec::new(); // (issue_id, ticket_id)
+        for (idx, result) in results {
+            if let SyncResult::Created { issue_id, .. } = result {
+                issue_ids.push((issue_id.clone(), &tickets[*idx].id));
+            }
+        }
+
+        if issue_ids.is_empty() {
+            return;
+        }
+
+        // Batch add to project
+        let ids: Vec<String> = issue_ids.iter().map(|(id, _)| id.clone()).collect();
+        match self.client.add_issues_to_project_batch(&project.id, &ids).await {
+            Ok(add_results) => {
+                println!();
+                for ((_, ticket_id), result) in issue_ids.iter().zip(add_results) {
+                    match result {
+                        Ok(_) => {
+                            println!("PROJECT {} → {} (added)", ticket_id, project.title);
+                        }
+                        Err(e) => {
+                            eprintln!("WARN    {} project add failed: {}", ticket_id, e);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("\nWARN    Failed to add issues to project: {}", e);
+            }
+        }
     }
 
     /// Check if a ticket needs updating, returns update details if so
