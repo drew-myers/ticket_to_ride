@@ -21,6 +21,7 @@ struct PendingCreate {
     title: String,
     body: String,
     label_ids: Vec<String>,
+    issue_type_id: Option<String>,
 }
 
 /// Pending update for batch processing
@@ -32,6 +33,7 @@ struct PendingUpdate {
     body: String,
     needs_close: bool,
     needs_reopen: bool,
+    issue_type_id: Option<String>,
 }
 
 /// Result of checking if an update is needed
@@ -66,8 +68,9 @@ pub struct SyncEngine {
     owner: String,
     repo_name: String,
     assignee_id: Option<String>,
-    label_cache: HashMap<String, String>,  // label name -> label ID
-    ticket_to_issue: HashMap<String, u64>, // ticket ID -> GitHub issue number
+    label_cache: HashMap<String, String>,       // label name -> label ID
+    ticket_to_issue: HashMap<String, u64>,      // ticket ID -> GitHub issue number
+    issue_type_cache: HashMap<String, String>,  // issue type name (lowercase) -> ID
 }
 
 impl SyncEngine {
@@ -94,6 +97,18 @@ impl SyncEngine {
             .map(|l| (l.name.to_lowercase(), l.id))
             .collect();
 
+        // Pre-fetch issue types (org-level feature, empty for personal repos)
+        let issue_types = client.get_issue_types(&owner, &repo_name).await?;
+        let issue_type_cache: HashMap<String, String> = issue_types
+            .into_iter()
+            .map(|t| (t.name.to_lowercase(), t.id))
+            .collect();
+
+        // Validate issue type mappings
+        if let Err(e) = validate_issue_type_mappings(&config.mapping.type_map, &issue_type_cache) {
+            anyhow::bail!("{}", e);
+        }
+
         Ok(Self {
             client,
             config,
@@ -103,6 +118,7 @@ impl SyncEngine {
             assignee_id,
             label_cache,
             ticket_to_issue: HashMap::new(), // Will be populated during sync
+            issue_type_cache,
         })
     }
 
@@ -174,17 +190,20 @@ impl SyncEngine {
                             body,
                             needs_close,
                             needs_reopen,
+                            issue_type_id: self.resolve_issue_type_id(&ticket.ticket_type),
                         });
                     }
                 }
             } else {
                 // Collect creates for batching
                 let label_ids = self.resolve_label_ids(&ticket.tags).await;
+                let issue_type_id = self.resolve_issue_type_id(&ticket.ticket_type);
                 pending_creates.push(PendingCreate {
                     ticket_idx: idx,
                     title: ticket.title.clone(),
                     body: self.format_issue_body(ticket),
                     label_ids,
+                    issue_type_id,
                 });
             }
         }
@@ -311,6 +330,7 @@ impl SyncEngine {
                 issue_id: p.issue_id.clone(),
                 title: p.title.clone(),
                 body: p.body.clone(),
+                issue_type_id: p.issue_type_id.clone(),
             })
             .collect();
 
@@ -396,6 +416,7 @@ impl SyncEngine {
                 title: p.title.clone(),
                 body: p.body.clone(),
                 label_ids: p.label_ids.clone(),
+                issue_type_id: p.issue_type_id.clone(),
             })
             .collect();
 
@@ -458,6 +479,11 @@ impl SyncEngine {
         }
 
         label_ids
+    }
+
+    /// Resolve issue type ID from ticket type using config mapping
+    fn resolve_issue_type_id(&self, ticket_type: &str) -> Option<String> {
+        resolve_issue_type(ticket_type, &self.config.mapping.type_map, &self.issue_type_cache)
     }
 
     /// Format the issue body with marker, content, and dependencies
@@ -611,6 +637,54 @@ pub fn extract_ticket_marker(body: &str) -> Option<&str> {
     Some(&after_start[..end])
 }
 
+/// Resolve issue type ID from ticket type using config mapping and cache
+/// Returns None if cache is empty (personal repos) or no mapping exists
+pub fn resolve_issue_type(
+    ticket_type: &str,
+    type_map: &HashMap<String, String>,
+    issue_type_cache: &HashMap<String, String>,
+) -> Option<String> {
+    // Skip if repo has no issue types
+    if issue_type_cache.is_empty() {
+        return None;
+    }
+
+    // Look up mapping in config
+    let github_type = type_map.get(ticket_type)?;
+
+    // Look up ID in cache (case-insensitive)
+    issue_type_cache.get(&github_type.to_lowercase()).cloned()
+}
+
+/// Validate issue type mappings against available types
+/// Returns Ok(()) if valid, Err with details if any mapping is invalid
+pub fn validate_issue_type_mappings(
+    type_map: &HashMap<String, String>,
+    issue_type_cache: &HashMap<String, String>,
+) -> Result<(), String> {
+    // Skip validation if no issue types available (personal repos)
+    if issue_type_cache.is_empty() {
+        return Ok(());
+    }
+
+    // Skip validation if no mappings configured
+    if type_map.is_empty() {
+        return Ok(());
+    }
+
+    for (ticket_type, github_type) in type_map {
+        if !issue_type_cache.contains_key(&github_type.to_lowercase()) {
+            let available: Vec<&str> = issue_type_cache.keys().map(|s| s.as_str()).collect();
+            return Err(format!(
+                "Issue type mapping error: '{}' -> '{}' not found.\nAvailable issue types: {:?}",
+                ticket_type, github_type, available
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -710,5 +784,142 @@ mod tests {
         let section = format_dependencies_section(&deps, &lookup);
 
         assert_eq!(section, "**Depends on:** #10, #20, `dep-3` (not synced)");
+    }
+
+    // Issue type resolution tests
+
+    #[test]
+    fn test_resolve_issue_type_with_valid_mapping() {
+        let mut type_map = HashMap::new();
+        type_map.insert("bug".to_string(), "Bug".to_string());
+        type_map.insert("task".to_string(), "Task".to_string());
+
+        let mut cache = HashMap::new();
+        cache.insert("bug".to_string(), "IT_bug_id".to_string());
+        cache.insert("task".to_string(), "IT_task_id".to_string());
+
+        assert_eq!(
+            resolve_issue_type("bug", &type_map, &cache),
+            Some("IT_bug_id".to_string())
+        );
+        assert_eq!(
+            resolve_issue_type("task", &type_map, &cache),
+            Some("IT_task_id".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_issue_type_case_insensitive() {
+        let mut type_map = HashMap::new();
+        type_map.insert("bug".to_string(), "BUG".to_string()); // uppercase in config
+
+        let mut cache = HashMap::new();
+        cache.insert("bug".to_string(), "IT_bug_id".to_string()); // lowercase in cache
+
+        assert_eq!(
+            resolve_issue_type("bug", &type_map, &cache),
+            Some("IT_bug_id".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_issue_type_no_mapping() {
+        let type_map = HashMap::new(); // no mappings
+
+        let mut cache = HashMap::new();
+        cache.insert("bug".to_string(), "IT_bug_id".to_string());
+
+        // No mapping for "bug" in type_map
+        assert_eq!(resolve_issue_type("bug", &type_map, &cache), None);
+    }
+
+    #[test]
+    fn test_resolve_issue_type_empty_cache() {
+        let mut type_map = HashMap::new();
+        type_map.insert("bug".to_string(), "Bug".to_string());
+
+        let cache = HashMap::new(); // personal repo, no issue types
+
+        // Should return None when cache is empty
+        assert_eq!(resolve_issue_type("bug", &type_map, &cache), None);
+    }
+
+    #[test]
+    fn test_resolve_issue_type_unknown_ticket_type() {
+        let mut type_map = HashMap::new();
+        type_map.insert("bug".to_string(), "Bug".to_string());
+
+        let mut cache = HashMap::new();
+        cache.insert("bug".to_string(), "IT_bug_id".to_string());
+
+        // "epic" not in type_map
+        assert_eq!(resolve_issue_type("epic", &type_map, &cache), None);
+    }
+
+    // Issue type validation tests
+
+    #[test]
+    fn test_validate_issue_type_mappings_valid() {
+        let mut type_map = HashMap::new();
+        type_map.insert("bug".to_string(), "Bug".to_string());
+        type_map.insert("task".to_string(), "Task".to_string());
+
+        let mut cache = HashMap::new();
+        cache.insert("bug".to_string(), "IT_bug_id".to_string());
+        cache.insert("task".to_string(), "IT_task_id".to_string());
+
+        assert!(validate_issue_type_mappings(&type_map, &cache).is_ok());
+    }
+
+    #[test]
+    fn test_validate_issue_type_mappings_invalid() {
+        let mut type_map = HashMap::new();
+        type_map.insert("bug".to_string(), "Bug".to_string());
+        type_map.insert("epic".to_string(), "Epic".to_string()); // Epic doesn't exist
+
+        let mut cache = HashMap::new();
+        cache.insert("bug".to_string(), "IT_bug_id".to_string());
+        cache.insert("task".to_string(), "IT_task_id".to_string());
+
+        let result = validate_issue_type_mappings(&type_map, &cache);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("epic"));
+        assert!(err.contains("Epic"));
+        assert!(err.contains("not found"));
+    }
+
+    #[test]
+    fn test_validate_issue_type_mappings_empty_cache_skips() {
+        let mut type_map = HashMap::new();
+        type_map.insert("epic".to_string(), "Epic".to_string());
+
+        let cache = HashMap::new(); // personal repo
+
+        // Should pass - validation skipped for personal repos
+        assert!(validate_issue_type_mappings(&type_map, &cache).is_ok());
+    }
+
+    #[test]
+    fn test_validate_issue_type_mappings_empty_type_map_skips() {
+        let type_map = HashMap::new(); // no mappings configured
+
+        let mut cache = HashMap::new();
+        cache.insert("bug".to_string(), "IT_bug_id".to_string());
+
+        // Should pass - no mappings to validate
+        assert!(validate_issue_type_mappings(&type_map, &cache).is_ok());
+    }
+
+    #[test]
+    fn test_validate_issue_type_mappings_case_insensitive() {
+        let mut type_map = HashMap::new();
+        type_map.insert("bug".to_string(), "BUG".to_string()); // uppercase
+
+        let mut cache = HashMap::new();
+        cache.insert("bug".to_string(), "IT_bug_id".to_string()); // lowercase
+
+        // Should pass - case insensitive matching
+        assert!(validate_issue_type_mappings(&type_map, &cache).is_ok());
     }
 }

@@ -29,6 +29,7 @@ pub struct IssueUpdate {
     pub issue_id: String,
     pub title: String,
     pub body: String,
+    pub issue_type_id: Option<String>,
 }
 
 /// Request to create an issue
@@ -37,11 +38,19 @@ pub struct IssueCreate {
     pub title: String,
     pub body: String,
     pub label_ids: Vec<String>,
+    pub issue_type_id: Option<String>,
 }
 
 /// Label information
 #[derive(Debug, Clone)]
 pub struct LabelInfo {
+    pub id: String,
+    pub name: String,
+}
+
+/// Issue type information (org-level feature)
+#[derive(Debug, Clone)]
+pub struct IssueTypeInfo {
     pub id: String,
     pub name: String,
 }
@@ -184,6 +193,28 @@ struct UserNode {
     id: String,
 }
 
+#[derive(Deserialize)]
+struct GetIssueTypesResponse {
+    repository: Option<GetIssueTypesRepository>,
+}
+
+#[derive(Deserialize)]
+struct GetIssueTypesRepository {
+    #[serde(rename = "issueTypes")]
+    issue_types: Option<IssueTypeConnection>,
+}
+
+#[derive(Deserialize)]
+struct IssueTypeConnection {
+    nodes: Vec<IssueTypeNode>,
+}
+
+#[derive(Deserialize)]
+struct IssueTypeNode {
+    id: String,
+    name: String,
+}
+
 impl GitHubClient {
     /// Get repository node ID
     pub async fn get_repository_id(&self, owner: &str, name: &str) -> Result<String> {
@@ -226,6 +257,46 @@ impl GitHubClient {
             .user
             .map(|u| u.id)
             .ok_or_else(|| anyhow::anyhow!("User '{}' not found", username))
+    }
+
+    /// Get issue types for a repository (org-level feature)
+    /// Returns empty vec for personal repos (which don't support issue types)
+    pub async fn get_issue_types(&self, owner: &str, name: &str) -> Result<Vec<IssueTypeInfo>> {
+        let query = r#"
+            query($owner: String!, $name: String!) {
+                repository(owner: $owner, name: $name) {
+                    issueTypes(first: 50) {
+                        nodes {
+                            id
+                            name
+                        }
+                    }
+                }
+            }
+        "#;
+
+        let variables = json!({
+            "owner": owner,
+            "name": name
+        });
+
+        let response: GetIssueTypesResponse = self.query(query, Some(variables)).await?;
+
+        let types = response
+            .repository
+            .and_then(|r| r.issue_types)
+            .map(|c| {
+                c.nodes
+                    .into_iter()
+                    .map(|n| IssueTypeInfo {
+                        id: n.id,
+                        name: n.name,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(types)
     }
 
     /// Create a new issue
@@ -329,6 +400,10 @@ impl GitHubClient {
 
             if !create.label_ids.is_empty() {
                 input["labelIds"] = json!(create.label_ids);
+            }
+
+            if let Some(ref type_id) = create.issue_type_id {
+                input["issueTypeId"] = json!(type_id);
             }
 
             variables.insert(format!("input_{}", i), input);
@@ -556,14 +631,17 @@ impl GitHubClient {
         // Build variables object
         let mut variables = serde_json::Map::new();
         for (i, update) in updates.iter().enumerate() {
-            variables.insert(
-                format!("input_{}", i),
-                json!({
-                    "id": update.issue_id,
-                    "title": update.title,
-                    "body": update.body
-                }),
-            );
+            let mut input = json!({
+                "id": update.issue_id,
+                "title": update.title,
+                "body": update.body
+            });
+
+            if let Some(ref type_id) = update.issue_type_id {
+                input["issueTypeId"] = json!(type_id);
+            }
+
+            variables.insert(format!("input_{}", i), input);
         }
 
         let response: serde_json::Value = self
