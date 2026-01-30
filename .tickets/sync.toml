@@ -1,0 +1,18 @@
+[github]
+repo = "drew-myers/ticket_to_ride"
+# project = "Project Name"
+assignee = "drew-myers"
+
+[mapping]
+type_field = "Type"
+
+[mapping.type]
+bug = "Bug"
+feature = "Feature"
+task = "Task"
+epic = "Epic"
+chore = "Chore"
+
+[labels]
+sync_tags = true
+create_missing = true
